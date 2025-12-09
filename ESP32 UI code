@@ -1,0 +1,382 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPI.h>
+
+// -------- SPI pins ----------
+#define PIN_SCLK 27
+#define PIN_MISO 12
+#define PIN_MOSI 13
+#define PIN_CS   14
+
+// -------- SPI settings ----------
+SPISettings spiSettings(
+  1000000,
+  MSBFIRST,
+  SPI_MODE0
+);
+
+// -------- WiFi AP settings ----------
+const char* AP_SSID     = "ESP32-LED";
+const char* AP_PASSWORD = "12345678";
+
+WebServer server(80);
+
+// -------- SPI read config ----------
+const uint16_t FRAME_LEN = 32;
+
+char   lineBuf[128];
+size_t lineIdx = 0;
+
+int   g_ch0      = 0;
+float g_current  = 0.0f;
+int   g_ch1      = 0;
+float g_voltage  = 0.0f;
+float g_tempC    = 0.0f;
+float g_tempF    = 0.0f;
+unsigned long g_lastUpdateMs = 0;
+
+// Command byte to send
+volatile uint8_t g_cmdByte = 0xFF; // 0xFF = no command
+
+// UI state
+bool g_ledOn        = false;
+bool g_fanOn        = false;
+bool g_heaterOn     = false;
+bool g_autoMode     = false;
+
+float g_desiredTempF = 0;
+bool  g_hasDesired   = false;
+
+// ----- Energy Tracking -----
+float g_powerW = 0;
+float g_energyWh = 0;
+float g_energyTodayWh = 0;
+unsigned long g_lastEnergyMs = 0;
+
+
+// -------- Send command to STM32 ----------
+void sendCommand(uint8_t cmd) {
+  g_cmdByte = cmd;
+  Serial.print("Send CMD: 0x");
+  Serial.println(cmd, HEX);
+}
+
+
+// -------- Parse incoming SPI text lines ----------
+void handleLine(char *line) {
+
+  if (strncmp(line, "CH0=", 4) == 0) {
+    int chVal; float current;
+    if (sscanf(line, "CH0=%d current=%f", &chVal, &current) == 2) {
+      g_ch0 = chVal;
+      g_current = current;
+    }
+  }
+  else if (strncmp(line, "CH1=", 4) == 0) {
+    int chVal; float voltage;
+    if (sscanf(line, "CH1=%d voltage=%f", &chVal, &voltage) == 2) {
+      g_ch1 = chVal;
+      g_voltage = voltage;
+    }
+  }
+  else if (strncmp(line, "Temperature=", 11) == 0) {
+    float tC, tF;
+    if (sscanf(line, "Temperature=%f C (%f F)", &tC, &tF) == 2) {
+      g_tempC = tC;
+      g_tempF = tF;
+    }
+  }
+}
+
+
+// -------- SPI Poll ----------
+void pollSTM32() {
+  SPI.beginTransaction(spiSettings);
+  digitalWrite(PIN_CS, LOW);
+
+  for (int i = 0; i < FRAME_LEN; i++) {
+    uint8_t out = (i == 0) ? g_cmdByte : 0x00;
+    uint8_t b = SPI.transfer(out);
+
+    if (b == 0x00 || b == 0xFF) continue;
+    if (b == '\r') continue;
+
+    if (b == '\n') {
+      lineBuf[lineIdx] = '\0';
+      handleLine(lineBuf);
+      lineIdx = 0;
+    }
+    else if (lineIdx < sizeof(lineBuf) - 1) {
+      lineBuf[lineIdx++] = (char)b;
+    }
+  }
+
+  digitalWrite(PIN_CS, HIGH);
+  SPI.endTransaction();
+
+  // DO NOT RESET g_cmdByte — this fixes the LED/fan/heater issues
+}
+
+
+// -------- JSON API ----------
+void handleData() {
+  String json = "{";
+  json += "\"current\":" + String(g_current, 2) + ",";
+  json += "\"voltage\":" + String(g_voltage, 2) + ",";
+  json += "\"tempF\":"   + String(g_tempF, 1) + ",";
+  json += "\"ledOn\":"   + String(g_ledOn ? 1 : 0) + ",";
+  json += "\"fanOn\":"   + String(g_fanOn ? 1 : 0) + ",";
+  json += "\"heaterOn\":" + String(g_heaterOn ? 1 : 0) + ",";
+  json += "\"autoMode\":" + String(g_autoMode ? 1 : 0) + ",";
+  json += "\"desiredF\":" + String(g_desiredTempF, 1) + ",";
+  json += "\"hasDesired\":" + String(g_hasDesired ? 1 : 0) + ",";
+  
+  // Energy fields
+  json += "\"powerW\":" + String(g_powerW, 3) + ",";
+  json += "\"energyWh\":" + String(g_energyWh, 3) + ",";
+  json += "\"energyTodayWh\":" + String(g_energyTodayWh, 3);
+
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+
+// -------- LED ----------
+void handleToggleLed() {
+  if (g_ledOn) {
+    sendCommand(0x00);
+    g_ledOn = false;
+  } else {
+    sendCommand(0x01);
+    g_ledOn = true;
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+
+// -------- Manual Fan ----------
+void handleFanToggle() {
+  if (g_fanOn) {
+    sendCommand(0x10);
+    g_fanOn = false;
+  } else {
+    sendCommand(0x11);
+    g_fanOn = true;
+    g_heaterOn = false;
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+
+// -------- Manual Heater ----------
+void handleHeaterToggle() {
+  if (g_heaterOn) {
+    sendCommand(0x20);
+    g_heaterOn = false;
+  } else {
+    sendCommand(0x21);
+    g_heaterOn = true;
+    g_fanOn = false;
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+
+// -------- Auto Mode Toggle ----------
+void handleAutoToggle() {
+  g_autoMode = !g_autoMode;
+
+  if (g_autoMode)
+    sendCommand(0xA1);
+  else
+    sendCommand(0xA0);
+
+  server.send(200, "text/plain", "OK");
+}
+
+
+// -------- Set Desired Temperature ----------
+void handleSetTemp() {
+  if (!server.hasArg("val")) {
+    server.send(400, "text/plain", "Missing val");
+    return;
+  }
+
+  g_desiredTempF = server.arg("val").toFloat();
+  g_hasDesired = true;
+
+  server.send(200, "text/plain", "OK");
+}
+
+
+// -------- HTML UI ----------
+void handleRoot() {
+  String html = R"=====(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>ESP32 Thermostat</title>
+<style>
+body { font-family:sans-serif; background:#111; color:#eee; text-align:center; }
+button { padding:12px 22px; font-size:18px; margin:10px; border:none; border-radius:8px; cursor:pointer; }
+.on { background:#2ecc71; }
+.off { background:#e74c3c; }
+.cards { display:flex; justify-content:center; flex-wrap:wrap; margin-top:20px; }
+.card { background:#222; padding:15px; margin:10px; border-radius:10px; min-width:180px; }
+.label { color:#aaa; }
+.value { font-size:1.4em; }
+input { font-size:18px; padding:8px; width:140px; }
+</style>
+</head>
+<body>
+
+<h1>ESP32 Smart Thermostat</h1>
+
+<button id="led_btn" class="off">LED</button>
+<button id="auto_btn" class="off">Auto Mode</button>
+
+<div style="margin-top:10px;">
+<button id="fan_btn" class="off">Fan</button>
+<button id="heater_btn" class="off">Heater</button>
+</div>
+
+<h2>Desired Temperature (°F)</h2>
+<input type="number" id="temp_in" placeholder="Enter °F"><br>
+<button onclick="updateTemp()">Update Temperature</button>
+
+<div class="cards">
+  <div class="card"><div class="label">Temperature</div><div class="value" id="temp_val">--</div></div>
+  <div class="card"><div class="label">Current</div><div class="value" id="current_val">--</div></div>
+  <div class="card"><div class="label">Voltage</div><div class="value" id="voltage_val">--</div></div>
+  <div class="card"><div class="label">Power</div><div class="value" id="power_val">--</div></div>
+  <div class="card"><div class="label">Energy Today</div><div class="value" id="energy_today_val">--</div></div>
+  <div class="card"><div class="label">Total Energy</div><div class="value" id="energy_total_val">--</div></div>
+</div>
+
+<script>
+async function refresh() {
+  const res = await fetch('/data');
+  const d = await res.json();
+
+  document.getElementById('temp_val').innerHTML =
+      d.tempF.toFixed(1) + " °F";
+  document.getElementById('current_val').innerHTML =
+      d.current.toFixed(2) + " A";
+  document.getElementById('voltage_val').innerHTML =
+      d.voltage.toFixed(2) + " V";
+
+  // NEW ENERGY DATA
+  document.getElementById('power_val').innerHTML =
+      d.powerW.toFixed(2) + " W";
+  document.getElementById('energy_today_val').innerHTML =
+      d.energyTodayWh.toFixed(3) + " Wh";
+  document.getElementById('energy_total_val').innerHTML =
+      d.energyWh.toFixed(3) + " Wh";
+
+  // LED
+  const ledBtn = document.getElementById('led_btn');
+  if (d.ledOn) { ledBtn.className='on'; ledBtn.innerHTML='LED OFF'; }
+  else         { ledBtn.className='off'; ledBtn.innerHTML='LED ON'; }
+
+  // Auto mode
+  const autoBtn = document.getElementById('auto_btn');
+  if (d.autoMode) autoBtn.className='on';
+  else            autoBtn.className='off';
+
+  // Manual Fan/Heater
+  document.getElementById('fan_btn').className =
+      d.fanOn ? 'on' : 'off';
+
+  document.getElementById('heater_btn').className =
+      d.heaterOn ? 'on' : 'off';
+}
+
+async function updateTemp() {
+  const val = document.getElementById('temp_in').value;
+  await fetch('/setTemp?val=' + val);
+}
+
+document.getElementById('led_btn').onclick    = () => fetch('/led');
+document.getElementById('auto_btn').onclick   = () => fetch('/auto');
+document.getElementById('fan_btn').onclick    = () => fetch('/fan');
+document.getElementById('heater_btn').onclick = () => fetch('/heater');
+
+setInterval(refresh, 800);
+refresh();
+</script>
+
+</body>
+</html>
+)=====";
+
+  server.send(200, "text/html", html);
+}
+
+
+// -------- SETUP ----------
+void setup() {
+  Serial.begin(115200);
+
+  SPI.begin(PIN_SCLK, PIN_MISO, PIN_MOSI, PIN_CS);
+  pinMode(PIN_CS, OUTPUT);
+  digitalWrite(PIN_CS, HIGH);
+
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.on("/led", handleToggleLed);
+  server.on("/fan", handleFanToggle);
+  server.on("/heater", handleHeaterToggle);
+  server.on("/auto", handleAutoToggle);
+  server.on("/setTemp", handleSetTemp);
+
+  server.begin();
+}
+
+
+// -------- LOOP ----------
+void loop() {
+  server.handleClient();
+
+  static unsigned long last = 0;
+  unsigned long now = millis();
+
+  if (now - last >= 500) {
+    pollSTM32();
+    last = now;
+  }
+
+  // ----- Auto Mode Logic -----
+  if (g_autoMode && g_hasDesired) {
+    if (g_tempF > g_desiredTempF + 0.5) {
+      sendCommand(0x11); // fan on
+      g_fanOn = true;
+      g_heaterOn = false;
+    }
+    else if (g_tempF < g_desiredTempF - 0.5) {
+      sendCommand(0x21); // heater on
+      g_heaterOn = true;
+      g_fanOn = false;
+    }
+    else {
+      sendCommand(0x10);
+      sendCommand(0x20);
+      g_fanOn = false;
+      g_heaterOn = false;
+    }
+  }
+
+  // ----- Energy Accumulation -----
+  unsigned long nowEnergy = millis();
+  if (nowEnergy - g_lastEnergyMs >= 1000) {
+    g_lastEnergyMs = nowEnergy;
+
+    g_powerW = g_voltage * g_current;
+
+    g_energyWh += g_powerW / 3600.0f;
+    g_energyTodayWh += g_powerW / 3600.0f;
+  }
+}
